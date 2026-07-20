@@ -24,16 +24,16 @@ Future<void> main() async {
   await Audio.instance.init();
   Audio.instance.startMusic();
 
-  runApp(const FeatherFieldFrenzyApp());
+  runApp(const FietherfieldFrenzyApp());
 }
 
-class FeatherFieldFrenzyApp extends StatelessWidget {
-  const FeatherFieldFrenzyApp({super.key});
+class FietherfieldFrenzyApp extends StatelessWidget {
+  const FietherfieldFrenzyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Feather Field Frenzy',
+      title: 'Fietherfield Frenzy',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.themeData,
       home: const SplashScreen(),

@@ -92,7 +92,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             Padding(
                               padding: const EdgeInsets.all(6),
                               child: Text(
-                                'Feather Field Frenzy\nVersion 1.0.0  •  App ID $appId',
+                                'Fietherfield Frenzy\nVersion 1.0.0  •  App ID $appId',
                                 textAlign: TextAlign.center,
                                 style: AppTheme.body(13, color: AppTheme.brown),
                               ),
