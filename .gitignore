@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Secrets — never commit APNs auth keys / signing keys / provisioning
+*.p8
+*.p12
+*.mobileprovision
+

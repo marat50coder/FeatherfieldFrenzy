@@ -1,0 +1,140 @@
+import 'dart:async';
+
+import 'package:firebase_messaging/firebase_messaging.dart';
+
+import 'frenzy_safe.dart';
+
+@pragma('vm:entry-point')
+Future<void> ffrBackgroundMessage(RemoteMessage _) async {}
+
+/// Push-notification hub. Waits for APNs on cold-start (Firebase can
+/// otherwise hand back `null` too early), extracts deep-link URLs from
+/// arriving payloads under multiple key aliases, and drives the invite
+/// screen's permission flow.
+class PerchSignalHub {
+  PerchSignalHub(this._safe, {required this.enabled});
+
+  final FrenzySafe _safe;
+  final bool enabled;
+  FirebaseMessaging? _messaging;
+  Future<void>? _bootFuture;
+  Future<bool>? _permissionFuture;
+  String? _token;
+
+  void Function(String url)? onDestination;
+  void Function(String token)? onTokenChanged;
+
+  String? get token => _token;
+
+  Future<void> boot() => _bootFuture ??= _boot();
+
+  Future<void> _boot() async {
+    if (!enabled) return;
+    final messaging = FirebaseMessaging.instance;
+    _messaging = messaging;
+    final initial = await messaging.getInitialMessage().timeout(
+      const Duration(seconds: 4),
+      onTimeout: () => null,
+    );
+    final initialUrl = initial == null ? null : _extract(initial.data);
+    if (initialUrl != null) await _safe.stashPushUrl(initialUrl);
+
+    FirebaseMessaging.onBackgroundMessage(ffrBackgroundMessage);
+    await messaging.setForegroundNotificationPresentationOptions(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
+    messaging.onTokenRefresh.listen((value) {
+      _token = value;
+      onTokenChanged?.call(value);
+    });
+    FirebaseMessaging.onMessageOpenedApp.listen((message) {
+      final url = _extract(message.data);
+      if (url == null) return;
+      final callback = onDestination;
+      if (callback == null) {
+        _safe.stashPushUrl(url);
+      } else {
+        callback(url);
+      }
+    });
+    await _waitForApns();
+    _token = await messaging.getToken();
+  }
+
+  String? _extract(Map<String, dynamic> payload) {
+    for (final key in const <String>[
+      'deep_link',
+      'target',
+      'url',
+      'deeplink',
+      'link',
+    ]) {
+      final value = payload[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+    }
+    for (final container in const <String>['payload', 'data']) {
+      final nested = payload[container];
+      if (nested is Map) {
+        final found = _extract(Map<String, dynamic>.from(nested));
+        if (found != null) return found;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _waitForApns({int attempts = 6}) async {
+    final messaging = _messaging;
+    if (messaging == null) return;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        if ((await messaging.getAPNSToken())?.isNotEmpty ?? false) return;
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(milliseconds: 550));
+    }
+  }
+
+  Future<bool> canOfferPermission() async {
+    if (!enabled || _safe.pushDeniedByOs) return false;
+    final messaging = _messaging;
+    if (messaging == null) return false;
+    final status =
+        (await messaging.getNotificationSettings()).authorizationStatus;
+    if (status == AuthorizationStatus.denied) {
+      await _safe.markPushDeniedByOs();
+      return false;
+    }
+    return status == AuthorizationStatus.notDetermined ||
+        status == AuthorizationStatus.provisional;
+  }
+
+  Future<bool> askPermission() {
+    return _permissionFuture ??= _performPermissionRequest().whenComplete(
+      () => _permissionFuture = null,
+    );
+  }
+
+  Future<bool> _performPermissionRequest() async {
+    if (!enabled || _messaging == null) return false;
+    final result = await _messaging!.requestPermission(
+      alert: true,
+      badge: true,
+      sound: true,
+      provisional: false,
+    );
+    final accepted =
+        result.authorizationStatus == AuthorizationStatus.authorized ||
+        result.authorizationStatus == AuthorizationStatus.provisional;
+    await _safe.setPushAllowed(accepted);
+    if (!accepted && result.authorizationStatus == AuthorizationStatus.denied) {
+      await _safe.markPushDeniedByOs();
+    }
+    if (accepted) {
+      await _waitForApns(attempts: 14);
+      _token = await _messaging!.getToken();
+      if (_token?.isNotEmpty ?? false) onTokenChanged?.call(_token!);
+    }
+    return accepted;
+  }
+}

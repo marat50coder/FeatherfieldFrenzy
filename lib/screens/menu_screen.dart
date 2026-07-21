@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../data/game_data.dart';
 import '../game/game_screen.dart';
+import '../services/audio.dart';
 import '../services/storage.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ui_kit.dart';
@@ -22,6 +23,17 @@ class MenuScreen extends StatefulWidget {
 
 class _MenuScreenState extends State<MenuScreen> {
   final store = GameStorage.instance;
+
+  @override
+  void initState() {
+    super.initState();
+    // Music starts here — the first moment the player lands in the white
+    // game. Splash, offline page, push-invitation and the gray WebView all
+    // stay silent. startMusic() is a no-op if the user has music disabled
+    // in settings, and it resume()s a paused player instead of restarting
+    // the track when we come back from GameScreen/Settings.
+    Audio.instance.startMusic();
+  }
 
   Future<void> _go(Widget screen) async {
     await Navigator.of(context).push(appRoute(screen));
