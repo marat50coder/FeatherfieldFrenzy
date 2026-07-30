@@ -6,19 +6,27 @@ import UserNotifications
 /// running) and stashes it under a SharedPreferences key that
 /// `ColdRouteReader` (Dart) consumes on the first frame.
 class SceneDelegate: FlutterSceneDelegate {
-  // MUST match `ColdRouteReader._dartKey` in the Dart layer, prefixed
-  // with `flutter.` (that's how the shared_preferences plugin namespaces
-  // its UserDefaults entries on iOS).
-  static let coldRouteKey = "flutter.ffr_launch_route"
+  /// MUST match `ColdRouteReader._dartKey` in the Dart layer, with the
+  /// `flutter.` prefix (that's how the shared_preferences plugin
+  /// namespaces UserDefaults entries on iOS).
+  static let coldRouteKey = "flutter.fzy_cold_launch_target"
 
-  private static let payloadKeys = [
+  // Keys the push payload may carry the deep-link under. Ordered by
+  // observed frequency in real campaigns so the fast path exits early.
+  private static let payloadKeys: [String] = [
     "deep_link",
     "target",
     "url",
     "deeplink",
     "link",
   ]
-  private static let nestedContainers = ["payload", "data"]
+
+  // Containers a payload may wrap the deep-link fields inside. Some
+  // campaign platforms nest `{data: {...}}`, others `{payload: {...}}`.
+  private static let nestedContainers: [String] = [
+    "payload",
+    "data",
+  ]
 
   override func scene(
     _ scene: UIScene,
@@ -28,9 +36,8 @@ class SceneDelegate: FlutterSceneDelegate {
     super.scene(scene, willConnectTo: session, options: connectionOptions)
 
     guard let response = connectionOptions.notificationResponse else { return }
-    guard
-      let route = Self.extractRoute(from: response.notification.request.content.userInfo)
-    else { return }
+    let payload = response.notification.request.content.userInfo
+    guard let route = Self.extractRoute(from: payload) else { return }
 
     let store = UserDefaults.standard
     store.set(route, forKey: Self.coldRouteKey)
@@ -44,18 +51,22 @@ class SceneDelegate: FlutterSceneDelegate {
   private static func extractRoute(
     from payload: [AnyHashable: Any]
   ) -> String? {
-    if let direct = pluck(from: payload) { return direct }
+    if let direct = firstNonEmptyString(in: payload) {
+      return direct
+    }
     for container in nestedContainers {
-      if let nested = payload[container] as? [AnyHashable: Any],
-         let value = pluck(from: nested) {
+      guard let nested = payload[container] as? [AnyHashable: Any] else {
+        continue
+      }
+      if let value = firstNonEmptyString(in: nested) {
         return value
       }
     }
     return nil
   }
 
-  private static func pluck(
-    from dictionary: [AnyHashable: Any]
+  private static func firstNonEmptyString(
+    in dictionary: [AnyHashable: Any]
   ) -> String? {
     for key in payloadKeys {
       guard let raw = dictionary[key] as? String else { continue }

@@ -2,73 +2,88 @@
 
 import 'dart:typed_data';
 
-/// ⚠️ Keep the seed and constants below byte-for-byte identical to
-/// `lib/hatchway/core/frenzy_cipher.dart`. Fietherfield Frenzy uses a
-/// unique cipher family (FNV-1a keystream + position-keyed XOR) that
-/// differs from every sibling project — do NOT port this file verbatim
-/// to another app.
+/// ⚠️ Keep the seed and every mixing constant below byte-for-byte
+/// identical to `lib/hatchway/core/frenzy_cipher.dart`. Fietherfield
+/// Frenzy runs a **XorShift32 keystream + nibble-swap** cipher which is
+/// unique to this app — no FNV loop, no RC4 S-box, no shared constants
+/// with any sibling project. Do NOT port this file verbatim to another
+/// app.
 const List<int> _frenzySeed = <int>[
-  0x46,
-  0x69,
-  0x65,
-  0x54,
-  0x68,
-  0x72,
-  0x2E,
-  0x46,
-  0x72,
+  0x66,
   0x7A,
-  0x39,
+  0x2D,
+  0x6E,
   0x37,
-  0x71,
+  0x39,
   0x2A,
-  0x1B,
+  0x50,
+  0x72,
+  0x74,
+  0x21,
+  0x35,
+  0x1D,
+  0x62,
+  0x4C,
+  0x33,
+  0x5F,
 ];
 
-const int _fnvOffset = 0x811C9DC5;
-const int _fnvPrime = 0x01000193;
-const int _mask32 = 0xFFFFFFFF;
-const int _mixConst = 0x85EBCA6B;
-const int _goldenGamma = 0x9E3779B9;
+const int _u32 = 0xFFFFFFFF;
 
-int _seedState() {
-  var state = _fnvOffset;
+const int _pumpA = 0x85EBCA6B;
+const int _pumpB = 0xC2B2AE35;
+
+const int _quadPhase = 47;
+const int _quadStep = 13;
+const int _finalStep = 89;
+const int _finalBias = 17;
+
+int _forgeSeed() {
+  var acc = 0;
   for (final byte in _frenzySeed) {
-    state = ((state ^ byte) * _fnvPrime) & _mask32;
+    acc = ((acc << 5) - acc + byte) & _u32;
   }
-  for (var round = 0; round < 4; round++) {
-    state = ((state ^ _goldenGamma) * _fnvPrime) & _mask32;
-  }
-  return state;
+  acc ^= acc >>> 16;
+  acc = (acc * _pumpA) & _u32;
+  acc ^= acc >>> 13;
+  acc = (acc * _pumpB) & _u32;
+  acc ^= acc >>> 16;
+  return acc == 0 ? 0x9E3779B1 : acc;
 }
 
-Uint8List _makeFrenzyKeystream(int length) {
-  var state = _seedState();
-  final result = Uint8List(length);
+Uint8List _weaveKeystream(int length) {
+  var state = _forgeSeed();
+  final stream = Uint8List(length);
   for (var i = 0; i < length; i++) {
-    state = (state ^ ((i * _mixConst) & _mask32)) & _mask32;
-    state = (state * _fnvPrime) & _mask32;
-    state = (((state >>> 11) | ((state << 21) & _mask32))) & _mask32;
-    result[i] = (state ^ (state >>> 16)) & 0xFF;
+    state = (state ^ ((state << 13) & _u32)) & _u32;
+    state = state ^ (state >>> 17);
+    state = (state ^ ((state << 5) & _u32)) & _u32;
+    stream[i] = (state ^ (state >>> 8) ^ (state >>> 16) ^ (state >>> 24)) & 0xFF;
   }
-  return result;
+  return stream;
 }
+
+int _flipNibbles(int byte) => (((byte & 0x0F) << 4) | ((byte & 0xF0) >>> 4));
 
 List<int> foldFrenzy(String value) {
   final bytes = Uint8List.fromList(value.codeUnits);
-  final stream = _makeFrenzyKeystream(bytes.length);
+  final stream = _weaveKeystream(bytes.length);
   return List<int>.generate(bytes.length, (i) {
-    final mixed = (bytes[i] + stream[i] + (i * 41)) & 0xFF;
-    return mixed ^ ((i * 61) & 0xFF);
+    final shifted = (bytes[i] + ((i * i * _quadStep + _quadPhase) & 0xFF)) & 0xFF;
+    final swapped = _flipNibbles(shifted);
+    final xored = swapped ^ stream[i];
+    return xored ^ ((i * _finalStep + _finalBias) & 0xFF);
   });
 }
 
 String unfoldFrenzy(List<int> encoded) {
-  final stream = _makeFrenzyKeystream(encoded.length);
+  final stream = _weaveKeystream(encoded.length);
   return String.fromCharCodes(
     List<int>.generate(encoded.length, (i) {
-      final xored = encoded[i] ^ ((i * 61) & 0xFF);
-      return (xored - stream[i] - (i * 41)) & 0xFF;
+      final unmasked = encoded[i] ^ ((i * _finalStep + _finalBias) & 0xFF);
+      final unxored = unmasked ^ stream[i];
+      final unswapped = _flipNibbles(unxored);
+      return (unswapped - ((i * i * _quadStep + _quadPhase) & 0xFF)) & 0xFF;
     }),
   );
 }
@@ -83,7 +98,7 @@ void main() {
     'support': 'https://featherfieldfrenzy.com/support.html',
     'gcd': 'https://gcdsdk.appsflyer.com/install_data/v5.0/',
     'webkit': '605.1.15',
-    'safari': '18.6',
+    'safari': '18.7',
     'safariTail': '604.1',
     'appsFlyerDevKey': 'N6ZJuLosa7PdPk2NzANkqd',
     'firebaseProjectNumber': '970361620296',

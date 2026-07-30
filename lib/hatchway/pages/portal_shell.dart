@@ -15,6 +15,19 @@ import '../infra/perch_signals.dart';
 import '../infra/plume_agent.dart';
 import 'no_connection_page.dart';
 
+// Ladder of reflow "pokes" (ms after a rotation) — WKWebView keeps the
+// pre-rotation viewport for ~a second, so we dispatch a resize/
+// orientationchange bounce a few times as the native frame settles.
+const List<int> _reflowLadder = <int>[55, 205, 380, 640, 950];
+
+// How long the cold-start viewport-settle delay is (ms). Immersive UI
+// must actually engage before WKWebView measures the viewport, or the
+// page renders stretched.
+const int _coldSettleMs = 300;
+
+// Debounce for the post-rotation "re-assert viewport lock" pass.
+const int _postRotationMs = 340;
+
 /// WebView shell for the gray flow. Handles cold-start viewport settle,
 /// rotation reflow, orientation-aware safe-area, push deep-links and a
 /// suite of native-feel JS injections.
@@ -48,61 +61,23 @@ class _PortalShellState extends State<PortalShell> with WidgetsBindingObserver {
   bool _offlineShown = false;
   int _redirectAttempts = 0;
   String? _lastMainUrl;
-  Timer? _metricsDebounce;
-  Size? _lastMetricsSize;
+  Timer? _lockDebounce;
+  Size? _priorMetrics;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     // Game music must never bleed into the gray WebView. It's normally
-    // never started before MenuScreen, but be defensive: if the user comes
-    // back to the app after a push while the game was foregrounded, we
-    // definitely don't want a loop of `music.wav` under the web page.
+    // never started before MenuScreen, but be defensive: if the user
+    // came back to the app after a push while the game was foregrounded,
+    // we definitely don't want a loop of `music.wav` under the web page.
     Audio.instance.stopMusic();
-    _enterImmersive();
-    SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
 
-    final params = Platform.isIOS
-        ? WebKitWebViewControllerCreationParams(
-            allowsInlineMediaPlayback: true,
-            mediaTypesRequiringUserAction: const <PlaybackMediaTypes>{},
-          )
-        : const PlatformWebViewControllerCreationParams();
-    _controller =
-        WebViewController.fromPlatformCreationParams(
-            params,
-            onPermissionRequest: (request) => request.grant(),
-          )
-          ..setJavaScriptMode(JavaScriptMode.unrestricted)
-          ..setBackgroundColor(Colors.black)
-          ..setUserAgent(widget.agent.userAgent)
-          ..enableZoom(false)
-          ..setNavigationDelegate(_navigation());
-    if (_controller.platform is WebKitWebViewController) {
-      (_controller.platform as WebKitWebViewController)
-          .setAllowsBackForwardNavigationGestures(true);
-    }
-
-    widget.signals.onDestination = (url) {
-      final uri = Uri.tryParse(url);
-      if (mounted && uri != null && uri.hasScheme) {
-        _controller.loadRequest(uri);
-      }
-    };
-    _networkSubscription = widget.probe.changes.listen((states) {
-      if (states.every((state) => state == ConnectivityResult.none)) {
-        // Connectivity is definitively gone — show offline immediately,
-        // no DNS probe (a probe hangs for seconds while offline and lets
-        // the WebView render its built-in error page first).
-        _goOffline();
-      }
-    });
+    _pinImmersive();
+    _allowAllOrientations();
+    _controller = _buildController();
+    _wireExternalTriggers();
 
     if (widget.coldLaunch) {
       _settleColdViewport();
@@ -110,22 +85,72 @@ class _PortalShellState extends State<PortalShell> with WidgetsBindingObserver {
       _viewportReady = true;
       _controller.loadRequest(Uri.parse(widget.url));
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) => _consumePending());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _drainPendingPush());
   }
 
-  void _enterImmersive() {
+  WebViewController _buildController() {
+    final params = Platform.isIOS
+        ? WebKitWebViewControllerCreationParams(
+            allowsInlineMediaPlayback: true,
+            mediaTypesRequiringUserAction: const <PlaybackMediaTypes>{},
+          )
+        : const PlatformWebViewControllerCreationParams();
+    final controller = WebViewController.fromPlatformCreationParams(
+      params,
+      onPermissionRequest: (request) => request.grant(),
+    )
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(Colors.black)
+      ..setUserAgent(widget.agent.userAgent)
+      ..enableZoom(false)
+      ..setNavigationDelegate(_navigation());
+    if (controller.platform is WebKitWebViewController) {
+      (controller.platform as WebKitWebViewController)
+          .setAllowsBackForwardNavigationGestures(true);
+    }
+    return controller;
+  }
+
+  void _wireExternalTriggers() {
+    widget.signals.onDestination = (url) {
+      final uri = Uri.tryParse(url);
+      if (!mounted || uri == null || !uri.hasScheme) return;
+      _controller.loadRequest(uri);
+    };
+    _networkSubscription = widget.probe.changes.listen(_onConnectivityEvent);
+  }
+
+  void _onConnectivityEvent(List<ConnectivityResult> states) {
+    // Connectivity is definitively gone — show offline immediately,
+    // no DNS probe (a probe hangs for seconds while offline and lets
+    // the WebView render its built-in error page first).
+    if (states.every((state) => state == ConnectivityResult.none)) {
+      _goOffline();
+    }
+  }
+
+  void _pinImmersive() {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
 
+  void _allowAllOrientations() {
+    SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+  }
+
   Future<void> _settleColdViewport() async {
-    _enterImmersive();
+    _pinImmersive();
     // Let immersive mode settle in the phone's ACTUAL orientation before
     // WKWebView mounts, so it measures the correct viewport. We do NOT
     // force a landscape nudge here — that made a cold-start push link
     // open sideways and then flip. Any residual stretch is corrected
-    // after load by the resize + single reload in onPageFinished, in the
-    // current orientation.
-    await Future<void>.delayed(const Duration(milliseconds: 280));
+    // after load by the resize + single reload in onPageFinished, in
+    // the current orientation.
+    await Future<void>.delayed(const Duration(milliseconds: _coldSettleMs));
     if (!mounted) return;
     setState(() => _viewportReady = true);
     await _controller.loadRequest(Uri.parse(widget.url));
@@ -137,123 +162,119 @@ class _PortalShellState extends State<PortalShell> with WidgetsBindingObserver {
     setState(() {});
     // On rotation the physical size flips. WKWebView can briefly render
     // at the pre-rotation viewport (stretched / "broken") until it
-    // recalcs. Once metrics settle, force a single resize + re-assert
-    // the inset CSS so the site reflows cleanly instead of jittering.
-    final view = View.of(context);
-    final size = view.physicalSize;
+    // recalcs. Once metrics settle, force a resize/orientationchange
+    // bounce and re-assert the inset CSS so the site reflows cleanly
+    // instead of jittering.
+    final size = View.of(context).physicalSize;
+    final prior = _priorMetrics;
+    _priorMetrics = size;
+    if (prior == null) return;
     final rotated =
-        _lastMetricsSize != null &&
-        ((_lastMetricsSize!.width < _lastMetricsSize!.height) !=
-            (size.width < size.height));
-    _lastMetricsSize = size;
+        (prior.width < prior.height) != (size.width < size.height);
     if (!rotated) return;
-    _enterImmersive();
-    _metricsDebounce?.cancel();
-    _pokeReflow(const [40, 160, 320, 560, 850]);
+    _pinImmersive();
+    _lockDebounce?.cancel();
+    _kickReflow(_reflowLadder);
   }
 
-  void _pokeReflow(List<int> delaysMs) {
-    for (final ms in delaysMs) {
+  void _kickReflow(List<int> ladder) {
+    for (final ms in ladder) {
       Timer(Duration(milliseconds: ms), () {
         if (!mounted) return;
         _controller
             .runJavaScript(
               'window.dispatchEvent(new Event("orientationchange"));'
               'window.dispatchEvent(new Event("resize"));'
-              'if(window.visualViewport)'
-              '  window.visualViewport.dispatchEvent(new Event("resize"));',
+              'window.visualViewport?.dispatchEvent(new Event("resize"));',
             )
             .catchError((_) {});
       });
     }
-    // Re-assert viewport lock once things have settled.
-    _metricsDebounce = Timer(const Duration(milliseconds: 320), () {
+    _lockDebounce = Timer(const Duration(milliseconds: _postRotationMs), () {
       if (!mounted) return;
-      _installSafeAreaSheet();
-      _installPinchLock();
+      _reassertSafeInsets();
+      _reassertPinchLock();
     });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _enterImmersive();
-      _consumePending();
-    }
+    if (state != AppLifecycleState.resumed) return;
+    _pinImmersive();
+    _drainPendingPush();
   }
 
-  Future<void> _consumePending() async {
+  Future<void> _drainPendingPush() async {
     final value = await widget.safe.consumePushUrl();
     final uri = value == null ? null : Uri.tryParse(value);
-    if (mounted && uri != null && uri.hasScheme) {
-      await _controller.loadRequest(uri);
-    }
+    if (!mounted || uri == null || !uri.hasScheme) return;
+    await _controller.loadRequest(uri);
   }
 
   NavigationDelegate _navigation() {
     return NavigationDelegate(
-      onPageStarted: (url) {
-        _lastMainUrl = url;
-      },
-      onPageFinished: (_) {
-        _redirectAttempts = 0;
-        _installSafeAreaSheet();
-        _installPinchLock();
-        _installTapGloss();
-        _installKeyboardLift();
-        _installInputFontFloor();
-        _installInlineVideoWake();
-        Future<void>.delayed(const Duration(milliseconds: 800), () async {
-          if (!mounted) return;
-          setState(() {});
-          await _controller.runJavaScript(
-            'window.dispatchEvent(new Event("resize"));'
-            'window.visualViewport?.dispatchEvent(new Event("resize"));',
-          );
-          _installSafeAreaSheet();
-          if (widget.coldLaunch && !_coldReloadIssued) {
-            _coldReloadIssued = true;
-            await _controller.reload();
-          }
-        });
-      },
-      onWebResourceError: (error) {
-        // -999 = cancelled (a new navigation superseded this one).
-        if (error.errorCode == -999) return;
-        // WKWebView sometimes reports isForMainFrame as null for the main
-        // navigation — treat null as main-frame so a real load failure
-        // is never silently swallowed (that was leaving the app "frozen").
-        final mainFrame = error.isForMainFrame ?? true;
-        final lower = error.description.toLowerCase();
-        final redirectLoop =
-            error.errorCode == -1007 ||
-            lower.contains('too_many_redirects') ||
-            lower.contains('too many redirects');
-        if (redirectLoop && _lastMainUrl != null && _redirectAttempts < 3) {
-          _redirectAttempts++;
-          _controller.loadRequest(Uri.parse(_lastMainUrl!));
-          return;
-        }
-        if (!mainFrame) return;
-        _showOfflineAfterProbe();
-      },
-      onNavigationRequest: (request) {
-        final uri = Uri.tryParse(request.url);
-        if (uri == null) return NavigationDecision.prevent;
-        if (<String>{
-          'http',
-          'https',
-          'about',
-          'data',
-          'blob',
-        }.contains(uri.scheme)) {
-          if (request.isMainFrame) _lastMainUrl = request.url;
-          return NavigationDecision.navigate;
-        }
-        launchUrl(uri, mode: LaunchMode.externalApplication);
-        return NavigationDecision.prevent;
-      },
+      onPageStarted: (url) => _lastMainUrl = url,
+      onPageFinished: (_) => _afterPageLoaded(),
+      onWebResourceError: _onResourceError,
+      onNavigationRequest: _onNavigationRequest,
     );
+  }
+
+  void _afterPageLoaded() {
+    _redirectAttempts = 0;
+    _reassertSafeInsets();
+    _reassertPinchLock();
+    _installTapGloss();
+    _installKeyboardLift();
+    _installInputFontFloor();
+    _installInlineVideoWake();
+    Future<void>.delayed(const Duration(milliseconds: 820), () async {
+      if (!mounted) return;
+      setState(() {});
+      await _controller.runJavaScript(
+        'window.dispatchEvent(new Event("resize"));'
+        'window.visualViewport?.dispatchEvent(new Event("resize"));',
+      );
+      _reassertSafeInsets();
+      if (widget.coldLaunch && !_coldReloadIssued) {
+        _coldReloadIssued = true;
+        await _controller.reload();
+      }
+    });
+  }
+
+  void _onResourceError(WebResourceError error) {
+    // -999 = cancelled (a new navigation superseded this one).
+    if (error.errorCode == -999) return;
+    // WKWebView sometimes reports isForMainFrame as null for the main
+    // navigation — treat null as main-frame so a real load failure is
+    // never silently swallowed (that was leaving the app "frozen").
+    final mainFrame = error.isForMainFrame ?? true;
+    final desc = error.description.toLowerCase();
+    final loopedRedirect = error.errorCode == -1007 ||
+        desc.contains('too_many_redirects') ||
+        desc.contains('too many redirects');
+    if (loopedRedirect && _lastMainUrl != null && _redirectAttempts < 3) {
+      _redirectAttempts++;
+      _controller.loadRequest(Uri.parse(_lastMainUrl!));
+      return;
+    }
+    if (!mainFrame) return;
+    _showOfflineAfterProbe();
+  }
+
+  FutureOr<NavigationDecision> _onNavigationRequest(
+    NavigationRequest request,
+  ) {
+    final uri = Uri.tryParse(request.url);
+    if (uri == null) return NavigationDecision.prevent;
+    const inlineSchemes = <String>{'http', 'https', 'about', 'data', 'blob'};
+    if (inlineSchemes.contains(uri.scheme)) {
+      if (request.isMainFrame) _lastMainUrl = request.url;
+      return NavigationDecision.navigate;
+    }
+    launchUrl(uri, mode: LaunchMode.externalApplication);
+    return NavigationDecision.prevent;
   }
 
   Future<void> _showOfflineAfterProbe() async {
@@ -294,213 +315,260 @@ class _PortalShellState extends State<PortalShell> with WidgetsBindingObserver {
     );
   }
 
-  /// Overwrites the site's safe-area CSS variables to zero and locks
-  /// the document edges against rubber-band overscroll. Never touches
-  /// html/body horizontal padding — see webview_safe_area_injection.
-  void _installSafeAreaSheet() {
+  /// Zeros the site's own safe-area CSS variables and locks the document
+  /// edges against rubber-band overscroll. Never touches html/body
+  /// horizontal padding (see `webview_safe_area_injection`).
+  void _reassertSafeInsets() {
     _controller.runJavaScript(r'''
-(() => {
-  const root = window;
-  if (root.__ffrSafeSheetGuard) return;
-  root.__ffrSafeSheetGuard = true;
-  const sheetId = 'ffr-safe-sheet';
-  const rules = [
-    ':root{',
-      '--safe-area-inset-top:0px!important;',
-      '--safe-area-inset-right:0px!important;',
-      '--safe-area-inset-bottom:0px!important;',
-      '--safe-area-inset-left:0px!important;',
-      '--sat:0px!important;--sar:0px!important;',
-      '--sab:0px!important;--sal:0px!important;',
-      '--safe-top:0px!important;--safe-right:0px!important;',
-      '--safe-bottom:0px!important;--safe-left:0px!important;',
-    '}',
+(function(root){
+  if (root['__fzyPortalX_safeSheet']) return;
+  root['__fzyPortalX_safeSheet'] = true;
+  var STYLE_ID = 'fzy-safe-sheet';
+  var CSS = ''
+    + ':root{'
+    +   '--safe-area-inset-top:0px!important;'
+    +   '--safe-area-inset-right:0px!important;'
+    +   '--safe-area-inset-bottom:0px!important;'
+    +   '--safe-area-inset-left:0px!important;'
+    +   '--sat:0px!important;--sar:0px!important;'
+    +   '--sab:0px!important;--sal:0px!important;'
+    +   '--safe-top:0px!important;--safe-right:0px!important;'
+    +   '--safe-bottom:0px!important;--safe-left:0px!important;'
+    + '}'
     // Lock document edges: no rubber-band that would reveal the black
     // scaffold above/below the site. Makes the page feel native.
-    'html,body{',
-      'overscroll-behavior:none!important;',
-      'overscroll-behavior-y:none!important;',
-    '}'
-  ].join('');
-  const keyboardOpen = () => {
-    const visual = root.visualViewport;
-    return !!visual && visual.height < root.innerHeight * 0.75;
-  };
-  const apply = () => {
-    if (keyboardOpen()) return;
-    const host = document.head || document.documentElement;
-    if (!host) return;
-    let meta = document.querySelector('meta[name="viewport"]');
-    if (!meta) {
+    + 'html,body{'
+    +   'overscroll-behavior:none!important;'
+    +   'overscroll-behavior-y:none!important;'
+    + '}';
+
+  function kbUp(){
+    var vv = root.visualViewport;
+    if (!vv) return false;
+    return vv.height < root.innerHeight * 0.75;
+  }
+
+  function ensureViewportMeta(host){
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (!meta){
       meta = document.createElement('meta');
       meta.name = 'viewport';
       meta.content = 'width=device-width, initial-scale=1, viewport-fit=contain';
       host.appendChild(meta);
-    } else {
-      const scrubbed = (meta.content || '')
-        .replace(/,?\s*viewport-fit\s*=\s*\w+/ig, '').trim();
-      meta.content = scrubbed + (scrubbed ? ', ' : '') + 'viewport-fit=contain';
+      return;
     }
-    let sheet = document.getElementById(sheetId);
-    if (!sheet) {
+    var cleaned = (meta.content || '')
+      .replace(/,?\s*viewport-fit\s*=\s*\w+/ig, '')
+      .trim();
+    meta.content = cleaned + (cleaned ? ', ' : '') + 'viewport-fit=contain';
+  }
+
+  function attachSheet(host){
+    var sheet = document.getElementById(STYLE_ID);
+    if (!sheet){
       sheet = document.createElement('style');
-      sheet.id = sheetId;
+      sheet.id = STYLE_ID;
       host.appendChild(sheet);
     }
-    sheet.textContent = rules;
-  };
-  const later = () => {
-    root.setTimeout(apply, 170);
-    root.setTimeout(apply, 640);
-  };
-  ['pushState', 'replaceState'].forEach((name) => {
-    const original = history[name];
-    history[name] = function () {
-      const outcome = original.apply(this, arguments);
-      later();
-      return outcome;
+    sheet.textContent = CSS;
+  }
+
+  function apply(){
+    if (kbUp()) return;
+    var host = document.head || document.documentElement;
+    if (!host) return;
+    ensureViewportMeta(host);
+    attachSheet(host);
+  }
+
+  function reschedule(){
+    root.setTimeout(apply, 175);
+    root.setTimeout(apply, 660);
+  }
+
+  var wrapHistory = function(name){
+    var original = history[name];
+    if (!original) return;
+    history[name] = function(){
+      var out = original.apply(this, arguments);
+      reschedule();
+      return out;
     };
-  });
-  root.addEventListener('popstate', later);
+  };
+  wrapHistory('pushState');
+  wrapHistory('replaceState');
+  root.addEventListener('popstate', reschedule);
+
   apply();
-  root.setInterval(apply, 2900);
-})();
+  root.setInterval(apply, 2950);
+})(window);
 ''');
   }
 
-  /// Locks the page at 1:1 scale — no pinch/double-tap/gesture zoom.
+  /// Locks the page at 1:1 scale — no pinch / double-tap / gesture zoom.
   /// Idempotent + re-asserts the viewport on SPA navigations.
-  void _installPinchLock() {
+  void _reassertPinchLock() {
     _controller.runJavaScript(r'''
-(() => {
-  if (window.__ffrPinchLockGuard) return;
-  window.__ffrPinchLockGuard = true;
-  const anchorViewport = () => {
-    const host = document.head || document.documentElement;
+(function(win, doc){
+  if (win['__fzyPortalX_pinchLock']) return;
+  win['__fzyPortalX_pinchLock'] = true;
+
+  var VIEWPORT_CONTENT =
+    'width=device-width, initial-scale=1.0, maximum-scale=1.0, '
+    + 'minimum-scale=1.0, user-scalable=no, viewport-fit=contain';
+
+  function anchor(){
+    var host = doc.head || doc.documentElement;
     if (!host) return;
-    let meta = document.querySelector('meta[name="viewport"]');
-    if (!meta) {
-      meta = document.createElement('meta');
+    var meta = doc.querySelector('meta[name="viewport"]');
+    if (!meta){
+      meta = doc.createElement('meta');
       meta.setAttribute('name', 'viewport');
       host.appendChild(meta);
     }
-    meta.setAttribute(
-      'content',
-      'width=device-width, initial-scale=1.0, maximum-scale=1.0, ' +
-      'minimum-scale=1.0, user-scalable=no, viewport-fit=contain'
-    );
-  };
-  anchorViewport();
-  const swallow = (event) => { event.preventDefault(); };
-  ['gesturestart', 'gesturechange', 'gestureend'].forEach((name) =>
-    document.addEventListener(name, swallow, { passive: false })
-  );
-  document.addEventListener('touchmove', (event) => {
-    if (event.scale !== undefined && event.scale !== 1) event.preventDefault();
+    meta.setAttribute('content', VIEWPORT_CONTENT);
+  }
+  anchor();
+
+  var swallow = function(ev){ ev.preventDefault(); };
+  var gestureEvents = ['gesturestart', 'gesturechange', 'gestureend'];
+  for (var i = 0; i < gestureEvents.length; i++){
+    doc.addEventListener(gestureEvents[i], swallow, { passive: false });
+  }
+
+  doc.addEventListener('touchmove', function(ev){
+    if (ev.scale !== undefined && ev.scale !== 1) ev.preventDefault();
   }, { passive: false });
-  let previousTap = 0;
-  document.addEventListener('touchend', (event) => {
-    const now = Date.now();
-    if (now - previousTap <= 300) event.preventDefault();
-    previousTap = now;
+
+  var priorTap = 0;
+  doc.addEventListener('touchend', function(ev){
+    var now = Date.now();
+    if (now - priorTap <= 305) ev.preventDefault();
+    priorTap = now;
   }, { passive: false });
-  ['pushState', 'replaceState'].forEach((name) => {
-    const original = history[name];
-    history[name] = function () {
-      const outcome = original.apply(this, arguments);
-      setTimeout(anchorViewport, 150);
-      return outcome;
+
+  ['pushState', 'replaceState'].forEach(function(name){
+    var original = history[name];
+    if (!original) return;
+    history[name] = function(){
+      var out = original.apply(this, arguments);
+      win.setTimeout(anchor, 155);
+      return out;
     };
   });
-  window.addEventListener('popstate', () => setTimeout(anchorViewport, 150));
-})();
+  win.addEventListener('popstate', function(){ win.setTimeout(anchor, 155); });
+})(window, document);
 ''');
   }
 
-  /// Kills the grey tap highlight WKWebView paints on every tap and the
-  /// long-press callout, so tapping elements feels native. Inputs still
-  /// remain selectable.
+  /// Kills the grey tap-highlight WKWebView paints on every tap and the
+  /// long-press callout — inputs stay selectable.
   void _installTapGloss() {
     _controller.runJavaScript(r'''
-(() => {
-  if (window.__ffrTapGlossSuppressor) return;
-  window.__ffrTapGlossSuppressor = true;
-  const sheet = document.createElement('style');
-  sheet.id = 'ffr-tap-gloss';
+(function(){
+  if (window['__fzyPortalX_tapGloss']) return;
+  window['__fzyPortalX_tapGloss'] = true;
+  var host = document.head || document.documentElement;
+  if (!host) return;
+  var sheet = document.createElement('style');
+  sheet.id = 'fzy-tap-gloss';
   sheet.textContent =
-    '*{-webkit-tap-highlight-color:transparent!important;}' +
-    '*:not(input):not(textarea):not([contenteditable="true"]){' +
-      '-webkit-touch-callout:none!important;}';
-  (document.head || document.documentElement).appendChild(sheet);
+    '*{-webkit-tap-highlight-color:transparent!important;}'
+    + '*:not(input):not(textarea):not([contenteditable="true"]){'
+    +   '-webkit-touch-callout:none!important;'
+    + '}';
+  host.appendChild(sheet);
 })();
 ''');
   }
 
   void _installKeyboardLift() {
     _controller.runJavaScript(r'''
-(() => {
-  if (window.__ffrKeyboardLift) return;
-  window.__ffrKeyboardLift = true;
-  const isEditable = (node) => !!node && (
-    node.matches?.('input, textarea, select, [contenteditable="true"]')
-  );
-  const revealActive = () => {
-    const focus = document.activeElement;
-    if (!isEditable(focus)) return;
-    focus.scrollIntoView({ behavior: 'auto', block: 'nearest' });
-  };
-  document.addEventListener('focusin', (event) => {
-    if (isEditable(event.target)) window.setTimeout(revealActive, 350);
+(function(win, doc){
+  if (win['__fzyPortalX_kbLift']) return;
+  win['__fzyPortalX_kbLift'] = true;
+
+  function isEditable(node){
+    return !!node && typeof node.matches === 'function'
+      && node.matches('input, textarea, select, [contenteditable="true"]');
+  }
+
+  function reveal(){
+    var target = doc.activeElement;
+    if (!isEditable(target)) return;
+    target.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+  }
+
+  doc.addEventListener('focusin', function(ev){
+    if (!isEditable(ev.target)) return;
+    win.setTimeout(reveal, 360);
   }, true);
-})();
+})(window, document);
 ''');
   }
 
   void _installInputFontFloor() {
     if (!Platform.isIOS) return;
     _controller.runJavaScript(r'''
-(() => {
-  if (window.__ffrInputFontFloor) return;
-  window.__ffrInputFontFloor = true;
-  const sheet = document.createElement('style');
+(function(){
+  if (window['__fzyPortalX_fontFloor']) return;
+  window['__fzyPortalX_fontFloor'] = true;
+  var host = document.head || document.documentElement;
+  if (!host) return;
+  var sheet = document.createElement('style');
+  sheet.id = 'fzy-font-floor';
   sheet.textContent =
-    'input,textarea,select,[contenteditable="true"]{' +
-      'font-size:max(16px,1em)!important;}';
-  (document.head || document.documentElement).appendChild(sheet);
+    'input,textarea,select,[contenteditable="true"]{'
+    + 'font-size:max(16px,1em)!important;'
+    + '}';
+  host.appendChild(sheet);
 })();
 ''');
   }
 
   void _installInlineVideoWake() {
     _controller.runJavaScript(r'''
-(() => {
-  if (window.__ffrInlineVideoWake) return;
-  window.__ffrInlineVideoWake = true;
-  const wake = (video) => {
+(function(doc){
+  if (window['__fzyPortalX_videoWake']) return;
+  window['__fzyPortalX_videoWake'] = true;
+
+  function wake(video){
     if (!(video instanceof HTMLVideoElement)) return;
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
     video.playsInline = true;
     video.autoplay = true;
-    const started = video.play();
-    if (started?.catch) started.catch(() => {});
-  };
-  const sweep = (node) => {
-    if (node instanceof HTMLVideoElement) wake(node);
-    node.querySelectorAll?.('video').forEach(wake);
-  };
-  sweep(document);
-  new MutationObserver((records) => {
-    records.forEach((record) => record.addedNodes.forEach(sweep));
-  }).observe(document.documentElement, { childList: true, subtree: true });
-})();
+    var promise = video.play();
+    if (promise && typeof promise.then === 'function'){
+      promise.catch(function(){});
+    }
+  }
+
+  function walk(root){
+    if (root instanceof HTMLVideoElement) wake(root);
+    if (root && typeof root.querySelectorAll === 'function'){
+      var found = root.querySelectorAll('video');
+      for (var i = 0; i < found.length; i++) wake(found[i]);
+    }
+  }
+
+  walk(doc);
+
+  var observer = new MutationObserver(function(records){
+    for (var r = 0; r < records.length; r++){
+      var added = records[r].addedNodes;
+      for (var n = 0; n < added.length; n++) walk(added[n]);
+    }
+  });
+  observer.observe(doc.documentElement, { childList: true, subtree: true });
+})(document);
 ''');
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _metricsDebounce?.cancel();
+    _lockDebounce?.cancel();
     _networkSubscription?.cancel();
     widget.signals.onDestination = null;
     SystemChrome.setEnabledSystemUIMode(
@@ -526,9 +594,9 @@ class _PortalShellState extends State<PortalShell> with WidgetsBindingObserver {
         body: _viewportReady
             ? Padding(
                 // Respect notch/Dynamic Island (top + sides) AND the home
-                // indicator (bottom) in BOTH orientations. Cold-start uses
-                // viewPadding (never EdgeInsets.zero) so the bottom inset
-                // is not lost while immersive mode settles.
+                // indicator (bottom) in BOTH orientations. Cold-start
+                // uses viewPadding (never EdgeInsets.zero) so the bottom
+                // inset is not lost while immersive mode settles.
                 padding: EdgeInsets.only(
                   top: safe.top,
                   bottom: safe.bottom,

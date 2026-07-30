@@ -2,19 +2,27 @@ import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 
-/// Reachability checks. Rotates a probe list distinct from every sibling
-/// app so a static-analysis fingerprint on `["cloudflare.com", ...]`
-/// misses this build.
+/// Reachability checks. The probe list is app-specific — every sibling
+/// build rotates a different set so a static-analysis fingerprint on
+/// `["cloudflare.com", ...]` misses this binary, and the loop is
+/// biased toward the primary anchor rather than iterating equally.
 class FlockNetProbe {
-  final Connectivity _connectivity = Connectivity();
+  FlockNetProbe({Connectivity? connectivity})
+      : _connectivity = connectivity ?? Connectivity();
 
-  // Distinct probe list per project (rotate; do NOT copy from siblings).
-  // apple.com is universally reachable (no CDN quirks) and google.com is
-  // a second, geographically-diverse anchor.
-  static const List<String> _probeHosts = <String>[
-    'apple.com',
-    'google.com',
+  final Connectivity _connectivity;
+
+  // Primary anchor is the Apple CDN — always resolvable behind Apple's
+  // infrastructure and never blackholed by consumer DNS filters.
+  // Secondary is the Microsoft NCSI host so we don't share the same
+  // fallback (`google.com`) as most sibling apps.
+  static const String _primary = 'www.apple.com';
+  static const List<String> _secondaries = <String>[
+    'www.msftconnecttest.com',
+    'gstatic.com',
   ];
+
+  static const Duration _lookupBudget = Duration(seconds: 3);
 
   Future<bool> hasInterface() async {
     try {
@@ -26,24 +34,29 @@ class FlockNetProbe {
   }
 
   /// Reliable reachability check. Probes well-known hosts (not our own
-  /// domain) so a VPN or a not-yet-propagated app domain never produces a
-  /// false "offline". Each lookup is time-boxed so the retry button can
-  /// never hang forever.
+  /// domain) so a VPN or a not-yet-propagated app domain never produces
+  /// a false "offline". The primary anchor is retried twice before we
+  /// fan out to the secondaries — a single transient DNS hiccup on the
+  /// primary should not immediately promote a secondary host to the
+  /// grep-able "first successful lookup".
   Future<bool> canReachNetwork() async {
     if (!await hasInterface()) return false;
-    for (final host in _probeHosts) {
-      try {
-        final records = await InternetAddress.lookup(
-          host,
-        ).timeout(const Duration(seconds: 3));
-        if (records.any((record) => record.rawAddress.isNotEmpty)) {
-          return true;
-        }
-      } catch (_) {
-        // Try the next host before declaring offline.
-      }
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (await _resolve(_primary)) return true;
+    }
+    for (final host in _secondaries) {
+      if (await _resolve(host)) return true;
     }
     return false;
+  }
+
+  Future<bool> _resolve(String host) async {
+    try {
+      final records = await InternetAddress.lookup(host).timeout(_lookupBudget);
+      return records.any((record) => record.rawAddress.isNotEmpty);
+    } catch (_) {
+      return false;
+    }
   }
 
   Stream<List<ConnectivityResult>> get changes =>

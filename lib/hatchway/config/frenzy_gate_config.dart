@@ -5,10 +5,10 @@ import '../core/frenzy_cipher.dart';
 /// ════════════════════════════════════════════════════════════
 ///
 /// Every secret ships as an obfuscated byte array (never plaintext). The
-/// cipher family (FNV-1a keystream + position-keyed XOR) is defined in
-/// `lib/hatchway/core/frenzy_cipher.dart` — a different family than the
-/// sibling app template uses, so the compiled bytes of decode() differ
-/// project-to-project.
+/// cipher family (XorShift32 keystream + nibble-swap byte transform) is
+/// defined in `lib/hatchway/core/frenzy_cipher.dart` — a different
+/// family than any sibling app template, so the compiled bytes of the
+/// decoder differ project-to-project.
 ///
 /// To regenerate the arrays after touching the seed or values, run:
 ///     dart run tool/encode_frenzy_gate.dart
@@ -28,51 +28,50 @@ abstract final class FrenzyGateConfig {
   // ── Encoded secrets — paste output of tool/encode_frenzy_gate.dart ─
   // endpoint: https://featherfieldfrenzy.com/config.php
   static const List<int> _endpoint = <int>[
-    110, 69, 202, 137, 202, 118, 231, 217, 6, 30, 60, 54, 145, 239, 197, 55,
-    224, 189, 236, 182, 42, 2, 101, 246, 20, 171, 10, 212, 150, 26, 65, 4,
-    174, 108, 56, 233, 90, 231, 134, 37, 43,
+    47, 6, 171, 112, 180, 146, 232, 16, 103, 211, 226, 206, 151, 205, 164, 217,
+    60, 143, 85, 232, 84, 191, 94, 24, 65, 119, 152, 140, 23, 211, 179, 91,
+    249, 49, 210, 136, 211, 14, 156, 135, 118,
   ];
   // privacy: https://featherfieldfrenzy.com/privacy-policy.html
   static const List<int> _privacy = <int>[
-    110, 69, 202, 137, 202, 118, 231, 217, 6, 30, 60, 54, 145, 239, 197, 55,
-    224, 189, 236, 182, 42, 2, 101, 246, 20, 171, 10, 212, 150, 26, 65, 23,
-    177, 113, 40, 225, 94, 80, 75, 61, 42, 164, 102, 65, 41, 216, 164, 193,
-    165, 228,
+    47, 6, 171, 112, 180, 146, 232, 16, 103, 211, 226, 206, 151, 205, 164, 217,
+    60, 143, 85, 232, 84, 191, 94, 24, 65, 119, 152, 140, 23, 211, 179, 104,
+    10, 193, 211, 8, 147, 242, 168, 7, 102, 81, 7, 166, 39, 74, 94, 55, 57, 84,
   ];
   // support: https://featherfieldfrenzy.com/support.html
   static const List<int> _support = <int>[
-    110, 69, 202, 137, 202, 118, 231, 217, 6, 30, 60, 54, 145, 239, 197, 55,
-    224, 189, 236, 182, 42, 2, 101, 246, 20, 171, 10, 212, 150, 26, 65, 20,
-    180, 110, 54, 147, 77, 173, 72, 37, 47, 167, 101,
+    47, 6, 171, 112, 180, 146, 232, 16, 103, 211, 226, 206, 151, 205, 164, 217,
+    60, 143, 85, 232, 84, 191, 94, 24, 65, 119, 152, 140, 23, 211, 179, 88,
+    90, 81, 115, 105, 162, 162, 184, 135, 181, 65, 55,
   ];
   // AppsFlyer GCD base — safe endpoint, still routed through the cipher so
   // it never appears in a strings dump.
   static const List<int> _gcd = <int>[
-    110, 69, 202, 137, 202, 118, 231, 217, 7, 28, 3, 55, 149, 229, 25, 12,
-    231, 182, 231, 180, 48, 11, 101, 234, 216, 189, 75, 170, 86, 6, 128, 20,
-    179, 121, 50, 150, 82, 189, 119, 49, 28, 225, 115, 111, 118, 218, 239,
+    47, 6, 171, 112, 180, 146, 232, 16, 87, 50, 210, 62, 215, 173, 232, 38, 76,
+    95, 196, 200, 180, 15, 94, 88, 6, 213, 172, 239, 19, 18, 135, 88, 42, 66,
+    178, 89, 80, 161, 237, 196, 134, 101, 86, 69, 114, 42, 195,
   ];
   // User-Agent version fragments — unique per app (see gray_user_agent).
   // webkit: 605.1.15
-  static const List<int> _webkit = <int>[60, 9, 11, 75, 8, 10, 229, 211];
-  // safari: 18.6
-  static const List<int> _safari = <int>[55, 1, 16, 179];
+  static const List<int> _webkit = <int>[0, 203, 95, 28, 144, 82, 136, 179];
+  // safari: 18.7
+  static const List<int> _safari = <int>[80, 74, 207, 140];
   // safariTail: 604.1
-  static const List<int> _safariTail = <int>[60, 9, 10, 75, 8];
+  static const List<int> _safariTail = <int>[0, 203, 175, 28, 144];
   // appsFlyerDevKey: N6ZJuLosa7PdPk2NzANkqd
   static const List<int> _appsFlyerKey = <int>[
-    84, 7, 236, 175, 180, 104, 167, 29, 1, 40, 47, 6, 233, 229, 5, 31,
-    145, 129, 194, 191, 61, 244,
+    129, 42, 13, 223, 212, 116, 236, 92, 55, 240, 145, 201, 21, 173, 168, 87,
+    47, 74, 186, 152, 5, 80,
   ];
   // firebaseProjectNumber: 970361620296
   static const List<int> _firebaseProject = <int>[
-    63, 6, 22, 182, 245, 15, 254, 222, 80, 45, 84, 244,
+    208, 58, 239, 76, 192, 34, 88, 64, 195, 47, 111, 234,
   ];
   // OneLink is OPTIONAL — it must NEVER be part of the gate-enable check.
   // oneLinkHost: featherfieldfrenzy.onelink.me
   static const List<int> _oneLinkHost = <int>[
-    108, 84, 231, 245, 199, 67, 162, 2, 25, 30, 11, 6, 151, 26, 208, 63,
-    145, 201, 34, 187, 50, 247, 92, 243, 24, 165, 10, 170, 156,
+    15, 23, 154, 176, 229, 229, 156, 140, 183, 211, 82, 201, 183, 60, 117, 89,
+    47, 206, 184, 89, 212, 64, 46, 232, 2, 84, 152, 239, 183,
   ];
 
   static String get endpoint => revealFrenzy(_endpoint);
